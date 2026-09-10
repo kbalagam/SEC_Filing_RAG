@@ -9,7 +9,7 @@ A retrieval-augmented generation (RAG) system that:
 2. Parses the raw HTML into labeled sections (Item 1A. Risk Factors, Item 7. MD&A, etc.)
 3. Chunks each section into token-sized pieces suitable for embedding
 4. Embeds every chunk with Gemini and stores it in a local vector database (Chroma)
-5. Given a question, retrieves the most relevant chunks and generates a cited answer — using only the retrieved text, never outside knowledge
+5. Given a question, retrieves the most relevant chunks using **hybrid search** (vector + keyword, fused via Reciprocal Rank Fusion) and generates a cited answer — using only the retrieved text, never outside knowledge
 
 ## Why this project
 
@@ -34,11 +34,16 @@ src/chunking.py                 — merge short / split long paragraphs into
 src/vectorstore.py              — embed each chunk (Gemini), store in Chroma
         │                          (resumable — safe to interrupt and rerun)
         ▼
-src/rag/retrieve.py             — embed a question, return top-k relevant chunks
-        │
-        ▼
-src/rag/generate.py             — build a labeled, cited prompt; generate an
-                                    answer grounded only in retrieved context
+src/rag/retrieve.py  ──┐        — embed a question, return top-k relevant
+        │               │         chunks via vector similarity (now also
+        │               │         tagged with id + rank for fusion)
+hybrid_search.py ───────┤        — BM25 keyword search over the same chunks,
+        │               │         fused with vector results via Reciprocal
+        │               │         Rank Fusion (see "Hybrid Search" below)
+        ▼               │
+src/rag/generate.py ◄───┘        — build a labeled, cited prompt from the
+                                    fused results; generate an answer
+                                    grounded only in retrieved context
 ```
 
 `scripts/run_pipeline.py` orchestrates ingestion → chunking → embedding for all configured companies. `app.py` is a Streamlit UI on top of the same, already-tested `retrieve_and_answer()` function.
@@ -71,6 +76,18 @@ Run tests:
 pytest tests/ -v
 ```
 
+## Hybrid Search
+
+Pure vector (semantic) search can underperform on queries containing specific, exact terms — embeddings capture *meaning*, not exact tokens, so a query like "What does the filing say about NHTSA?" might retrieve chunks about regulatory bodies in general rather than the one asked about by name.
+
+**Fix:** `hybrid_search.py` runs a second, independent retrieval method — BM25 keyword search (via `rank_bm25`) — alongside the existing vector search, then fuses both ranked result lists using **Reciprocal Rank Fusion (RRF)** rather than naive score averaging. RRF combines *ranks*, not raw scores, because BM25 and vector-similarity scores live on completely incompatible scales; naive averaging or min-max normalization is fragile to outliers on either side. RRF rewards chunks that both methods agree on, regardless of their raw score scales.
+
+**Verified with a real, targeted test — in both isolated testing and the live deployed app:** asking "What does the filing say about NHTSA?" correctly surfaced Tesla's regulatory compliance section (mentioning NHTSA, FMVSS, and Corporate Average Fuel Economy standards by name) as the top result.
+
+**A real bug was found and partially fixed during development.** A dense, tabular MSFT exhibits-list chunk (full of form codes like "101.INS") scored artificially high under BM25's rarity-based term weighting, despite being irrelevant to most queries — BM25 rewards rare tokens, and boilerplate tables are full of them. Improved tokenization (stripping punctuation before splitting) helped marginally, but the chunk still ranked #1 in BM25-only results even after the fix. **What actually resolved the final, fused ranking was RRF's cross-method-agreement property** — the vector search component correctly downweighted the irrelevant chunk, and fusion rewarded the results both methods agreed on. This distinction (the tokenization fix helped a little; the fusion architecture is what really mattered) is worth stating precisely rather than overclaiming the fix.
+
+The BM25 index is built once from all chunks already stored in Chroma (not rebuilt per-query) and cached as a Streamlit resource, same pattern as the API client and vector collection.
+
 ## Known limitations
 
 These were found through real debugging, not theoretical — each was investigated with direct evidence before being accepted as a deliberate tradeoff rather than chased indefinitely.
@@ -79,21 +96,23 @@ These were found through real debugging, not theoretical — each was investigat
 - **Multi-span header titles may contain a stray space at the split point** (e.g. "ITEM 1. B USINESS" instead of "BUSINESS"). This is cosmetic — it affects the citation *label* only. The underlying paragraph *content* in that section is complete and correctly retrieved; verified via direct inspection.
 - **One isolated section-boundary miss was found** (a TSLA "ITEM 1A. RISK FACTORS" header wasn't detected at one specific occurrence, so it appeared as trailing text in the prior section instead of starting a new one). Confirmed via targeted follow-up queries (legal proceedings, properties, cybersecurity sections) to be an isolated occurrence, not a systemic pattern.
 - **The last paragraph in a section may form its own chunk under the minimum token threshold**, since there's nothing after it to merge with. Documented and accepted rather than adding backward-merge logic, which would risk pushing the previous chunk over the maximum size instead.
-- **Table data is not specially parsed.** Financial tables lose their row/column structure when flattened to text. This is a known, industry-recognized RAG failure mode (fixed-size or naive splitters commonly separate table headers from their data), not unique to this project. A production version would parse `<table>` elements separately.
+- **Table data is not specially parsed.** Financial tables lose their row/column structure when flattened to text. This is a known, industry-recognized RAG failure mode (fixed-size or naive splitters commonly separate table headers from their data), not unique to this project. A production version would parse `<table>` elements separately. This same limitation is also why BM25 can be thrown off by dense tabular sections (see "Hybrid Search" above).
 - **Citation fabrication was found and fixed during testing.** An early version of the generation prompt allowed the model to invent plausible-looking page numbers not present in the actual metadata. Fixed by making the system prompt explicitly forbid citing anything beyond what's in the `[Source: ...]` label — verified fixed via direct before/after comparison on the same question.
 
 ## What I'd improve with more time
 
 - Parse `<table>` elements separately from prose, so financial statement data isn't lost
+- Exclude non-prose sections (exhibit lists, tables of contents) from the BM25 index entirely, rather than relying on fusion alone to compensate for their false-positive keyword matches
 - Fix the multi-span header-splitting cosmetic issue with word-boundary-aware joining
 - Add a real evaluation set (20+ question/expected-answer pairs) and track retrieval accuracy over time, rather than manual spot-checking
-- Support incremental updates (new filings) without re-running the full pipeline
+- Support incremental updates (new filings) without re-running the full pipeline, including automatically rebuilding the BM25 index (it does not update incrementally the way Chroma does)
 - Add response streaming in the UI for better perceived latency
 
 ## Tech stack
 
 - **LLM & embeddings:** Google Gemini (`gemini-3.6-flash` for generation, `gemini-embedding-001` for embeddings)
 - **Vector store:** ChromaDB (local, persistent)
+- **Keyword search:** `rank_bm25` (BM25Okapi), fused with vector search via Reciprocal Rank Fusion
 - **Data source:** SEC EDGAR public API
 - **UI:** Streamlit
 - **Chunking:** custom token-aware chunker (tiktoken for counting) with sentence-boundary-safe overlap
