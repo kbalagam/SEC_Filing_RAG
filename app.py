@@ -34,6 +34,10 @@ def load_client_and_collection():
     collection = get_chroma_collection(CHROMA_DB_PATH, CHROMA_COLLECTION_NAME)
     return client, collection
 
+@st.cache_resource
+def load_bm25_index(_collection):
+    from hybrid_search import build_bm25_index
+    return build_bm25_index(_collection)
 
 try:
     client, collection = load_client_and_collection()
@@ -55,6 +59,8 @@ if chunk_count == 0:
     )
     st.stop()
 
+bm25_index = load_bm25_index(collection)
+
 st.caption(f"Database contains {chunk_count} indexed chunks.")
 
 with st.expander("Example questions"):
@@ -70,7 +76,7 @@ top_k = st.slider("Number of source chunks to retrieve", min_value=1, max_value=
 if st.button("Ask", type="primary") and question.strip():
     with st.spinner("Retrieving relevant filing sections and generating an answer..."):
         try:
-            answer = retrieve_and_answer(client, collection, question, top_k=top_k)
+            answer = retrieve_and_answer(client, collection, bm25_index, question, top_k=top_k)
             st.markdown("### Answer")
             st.markdown(answer)
         except Exception as e:

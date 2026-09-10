@@ -66,14 +66,10 @@ Question: {question}"""
     return response.text
 
 
-def retrieve_and_answer(client, collection, question: str, top_k: int = None) -> str:
-    """Full RAG loop: retrieve real chunks for the question, then
-    generate a grounded, cited answer from them. Combines retrieve()
-    and generate_answer() — only wired together after both were
-    independently tested and verified working."""
-    from src.rag.retrieve import retrieve
+def retrieve_and_answer(client, collection, bm25_index, question: str, top_k: int = None) -> str:
+    from hybrid_search import hybrid_retrieve
     from src.config import DEFAULT_TOP_K
 
     k = top_k if top_k is not None else DEFAULT_TOP_K
-    hits = retrieve(client, collection, question, k)
+    hits = hybrid_retrieve(client, collection, bm25_index, question, k)
     return generate_answer(client, question, hits)
